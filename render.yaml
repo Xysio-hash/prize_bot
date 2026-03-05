@@ -1,0 +1,11 @@
+services:
+  - type: worker
+    name: prize-bot
+    runtime: python
+    repo: https://github.com/Xysio-hash/prize_bot
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
