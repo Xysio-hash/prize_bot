@@ -1,5 +1,5 @@
-# Твой токен от BotFather
-BOT_TOKEN = "8675324310:AAHceUpsblKhy8wtDp6wbo698lzSgZ9WFwU"  # ВСТАВЬ СВОЙ ТОКЕН
+import os
 
-# Настройки розыгрыша
-WEEKLY_PRIZE = "1000 рублей"  # Приз по умолчанию
+# Токен будет браться из переменных окружения на Render
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
+WEEKLY_PRIZE = "1000 рублей"
