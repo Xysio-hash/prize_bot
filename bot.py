@@ -8,6 +8,7 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 import config
 from database import Database
 import random
+from aiohttp import web  # Добавлено для сервера на Render
 
 # Включаем логирование
 logging.basicConfig(level=logging.INFO)
@@ -16,6 +17,23 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
 db = Database()
+
+# Константа с именем канала
+CHANNEL_USERNAME = "@colizeum_kp67"  # Ваш канал
+
+# Функция проверки подписки
+async def check_subscription(user_id: int) -> bool:
+    """Проверяет, подписан ли пользователь на канал"""
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        # Статусы, при которых пользователь считается подписанным
+        if member.status in ['member', 'administrator', 'creator']:
+            return True
+        return False
+    except Exception as e:
+        print(f"Ошибка проверки подписки для {user_id}: {e}")
+        # В случае ошибки не пускаем, чтобы избежать накруток
+        return False
 
 # Клавиатура главного меню
 def get_main_keyboard():
@@ -27,6 +45,16 @@ def get_main_keyboard():
     builder.adjust(2)  # по 2 кнопки в ряд
     return builder.as_markup(resize_keyboard=True)
 
+# Клавиатура для проверки подписки
+def get_subscription_keyboard():
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Подписаться на канал", url=f"https://t.me/colizeum_kp67")],
+            [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")]
+        ]
+    )
+    return keyboard
+
 # Команда /start
 @dp.message(Command("start"))
 async def start_command(message: Message):
@@ -34,6 +62,24 @@ async def start_command(message: Message):
     username = message.from_user.username or "NoUsername"
     first_name = message.from_user.first_name
     
+    # Добавляем пользователя в БД в любом случае
+    db.add_user(user_id, username, first_name)
+    
+    # ПРОВЕРКА ПОДПИСКИ
+    is_subscribed = await check_subscription(user_id)
+    
+    if not is_subscribed:
+        # Если не подписан - просим подписаться
+        await message.answer(
+            f"👋 Привет, {first_name}!\n\n"
+            f"Для доступа к розыгрышу нужно подписаться на наш канал:\n"
+            f"{CHANNEL_USERNAME}\n\n"
+            f"После подписки нажмите кнопку 'Я подписался' 👇",
+            reply_markup=get_subscription_keyboard()
+        )
+        return  # Выходим, не давая доступ к боту
+    
+    # --- ЕСЛИ ПОДПИСКА ЕСТЬ ---
     # Проверяем, есть ли реферальный параметр (кто пригласил)
     args = message.text.split()
     referrer_id = None
@@ -46,9 +92,6 @@ async def start_command(message: Message):
                 referrer_id = None
         except:
             referrer_id = None
-    
-    # Добавляем пользователя в БД
-    db.add_user(user_id, username, first_name)
     
     # Если есть пригласивший, добавляем реферала
     if referrer_id:
@@ -76,10 +119,46 @@ async def start_command(message: Message):
     
     await message.answer(welcome_text, reply_markup=get_main_keyboard())
 
+# Обработчик кнопки "Я подписался"
+@dp.callback_query(lambda c: c.data == "check_sub")
+async def check_subscription_callback(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    first_name = callback_query.from_user.first_name
+    
+    is_subscribed = await check_subscription(user_id)
+    
+    if is_subscribed:
+        # Если подписался - поздравляем и даем доступ
+        await callback_query.message.edit_text(
+            f"✅ Спасибо за подписку, {first_name}!\n\n"
+            f"Теперь вам доступен розыгрыш бонусов!\n"
+            f"Нажмите /start, чтобы начать."
+        )
+        # Можно сразу отправить главное меню
+        await callback_query.message.answer(
+            f"Добро пожаловать!",
+            reply_markup=get_main_keyboard()
+        )
+    else:
+        # Если всё еще не подписан
+        await callback_query.answer(
+            "❌ Вы ещё не подписались на канал. Пожалуйста, подпишитесь и нажмите кнопку снова.",
+            show_alert=True
+        )
+
 # Мои билеты
 @dp.message(lambda message: message.text == "🎫 Мои билеты")
 async def my_tickets(message: Message):
     user_id = message.from_user.id
+    
+    # Дополнительная проверка подписки при каждом действии
+    if not await check_subscription(user_id):
+        await message.answer(
+            "❌ Вы отписались от канала. Подпишитесь снова для доступа к боту.",
+            reply_markup=get_subscription_keyboard()
+        )
+        return
+    
     stats = db.get_user_stats(user_id)
     
     # Получаем общее количество участников для расчета шанса
@@ -105,6 +184,16 @@ async def my_tickets(message: Message):
 # Топ недели
 @dp.message(lambda message: message.text == "📊 Топ недели")
 async def top_week(message: Message):
+    user_id = message.from_user.id
+    
+    # Проверка подписки
+    if not await check_subscription(user_id):
+        await message.answer(
+            "❌ Вы отписались от канала. Подпишитесь снова для доступа к боту.",
+            reply_markup=get_subscription_keyboard()
+        )
+        return
+    
     top_users = db.get_top_users(10)
     
     if not top_users:
@@ -134,6 +223,15 @@ async def top_week(message: Message):
 @dp.message(lambda message: message.text == "🔗 Пригласить друга")
 async def invite_friend(message: Message):
     user_id = message.from_user.id
+    
+    # Проверка подписки
+    if not await check_subscription(user_id):
+        await message.answer(
+            "❌ Вы отписались от канала. Подпишитесь снова для доступа к боту.",
+            reply_markup=get_subscription_keyboard()
+        )
+        return
+    
     bot_username = (await bot.me()).username
     
     ref_link = f"https://t.me/{bot_username}?start=ref{user_id}"
@@ -163,6 +261,16 @@ async def copy_link_callback(callback_query: types.CallbackQuery):
 # О розыгрыше
 @dp.message(lambda message: message.text == "🏆 О розыгрыше")
 async def about_prize(message: Message):
+    user_id = message.from_user.id
+    
+    # Проверка подписки
+    if not await check_subscription(user_id):
+        await message.answer(
+            "❌ Вы отписались от канала. Подпишитесь снова для доступа к боту.",
+            reply_markup=get_subscription_keyboard()
+        )
+        return
+    
     week_start = db.get_week_start()
     
     db.cursor.execute(
@@ -193,7 +301,7 @@ async def about_prize(message: Message):
 @dp.message(Command("draw"))
 async def draw_winner(message: Message):
     # Проверка на админа (замени ID на свой)
-    if message.from_user.id != 1335144671:  # ВСТАВЬ СВОЙ TELEGRAM ID
+    if message.from_user.id != 1335144671:  # ВАШ TELEGRAM ID
         await message.answer("❌ Эта команда только для администратора")
         return
     
@@ -245,8 +353,22 @@ async def draw_winner(message: Message):
     except:
         pass
 
+# HTTP сервер для Render (чтобы убрать предупреждения о портах)
+async def start_web_server():
+    """Запускает простой HTTP сервер для проверки Render"""
+    app = web.Application()
+    app.router.add_get('/', lambda request: web.Response(text="Bot is running"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 10000)
+    await site.start()
+    logging.info("Keep-alive server started on port 10000")
+
 # Запуск бота
 async def main():
+    # Запускаем HTTP сервер для Render
+    asyncio.create_task(start_web_server())
+    # Запускаем бота
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
