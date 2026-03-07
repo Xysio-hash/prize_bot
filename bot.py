@@ -1,14 +1,17 @@
 import logging
 import asyncio
+import random
+import string
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.enums import ParseMode
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 import config
 from database import Database
 import random
-from aiohttp import web  # Добавлено для сервера на Render
+from aiohttp import web
+from datetime import datetime, timedelta
 
 # Включаем логирование
 logging.basicConfig(level=logging.INFO)
@@ -21,18 +24,26 @@ db = Database()
 # Константа с именем канала
 CHANNEL_USERNAME = "@colizeum_kp67"  # Ваш канал
 
+# Хранилище для временных кодов подтверждения
+# Структура: {friend_id: {"referrer_id": id, "code": "ABC123", "expires": timestamp}}
+pending_confirmations = {}
+
+# Функция генерации случайного кода
+def generate_confirmation_code(length=6):
+    """Генерирует случайный код из букв и цифр"""
+    characters = string.ascii_uppercase + string.digits
+    return ''.join(random.choice(characters) for _ in range(length))
+
 # Функция проверки подписки
 async def check_subscription(user_id: int) -> bool:
     """Проверяет, подписан ли пользователь на канал"""
     try:
         member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
-        # Статусы, при которых пользователь считается подписанным
         if member.status in ['member', 'administrator', 'creator']:
             return True
         return False
     except Exception as e:
         print(f"Ошибка проверки подписки для {user_id}: {e}")
-        # В случае ошибки не пускаем, чтобы избежать накруток
         return False
 
 # Клавиатура главного меню
@@ -42,7 +53,7 @@ def get_main_keyboard():
     builder.add(KeyboardButton(text="📊 Топ недели"))
     builder.add(KeyboardButton(text="🔗 Пригласить друга"))
     builder.add(KeyboardButton(text="🏆 О розыгрыше"))
-    builder.adjust(2)  # по 2 кнопки в ряд
+    builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)
 
 # Клавиатура для проверки подписки
@@ -65,7 +76,19 @@ async def start_command(message: Message):
     # Добавляем пользователя в БД в любом случае
     db.add_user(user_id, username, first_name)
     
-    # ПРОВЕРКА ПОДПИСКИ
+    # Проверяем, есть ли реферальный параметр (кто пригласил)
+    args = message.text.split()
+    referrer_id = None
+    
+    if len(args) > 1 and args[1].startswith('ref'):
+        try:
+            referrer_id = int(args[1].replace('ref', ''))
+            if referrer_id == user_id:
+                referrer_id = None
+        except:
+            referrer_id = None
+    
+    # Проверка подписки на канал
     is_subscribed = await check_subscription(user_id)
     
     if not is_subscribed:
@@ -77,35 +100,42 @@ async def start_command(message: Message):
             f"После подписки нажмите кнопку 'Я подписался' 👇",
             reply_markup=get_subscription_keyboard()
         )
-        return  # Выходим, не давая доступ к боту
+        return
     
-    # --- ЕСЛИ ПОДПИСКА ЕСТЬ ---
-    # Проверяем, есть ли реферальный параметр (кто пригласил)
-    args = message.text.split()
-    referrer_id = None
-    
-    if len(args) > 1 and args[1].startswith('ref'):
-        try:
-            referrer_id = int(args[1].replace('ref', ''))
-            # Не даем себя пригласить
-            if referrer_id == user_id:
-                referrer_id = None
-        except:
-            referrer_id = None
-    
-    # Если есть пригласивший, добавляем реферала
+    # Если есть пригласивший И пользователь подписан
     if referrer_id:
-        # Проверяем, что пригласивший существует
+        # Проверяем, существует ли пригласивший
         if db.get_referrer_by_start_param(referrer_id):
-            success = db.add_referral(referrer_id, user_id)
-            if success:
-                await bot.send_message(
-                    referrer_id,
-                    f"🎉 По вашей ссылке зарегистрировался {first_name}!\n"
-                    f"Ваши билеты обновлены!"
-                )
+            # Генерируем код подтверждения
+            confirm_code = generate_confirmation_code()
+            expires_at = datetime.now() + timedelta(minutes=10)  # Код действует 10 минут
+            
+            # Сохраняем во временное хранилище
+            pending_confirmations[user_id] = {
+                "referrer_id": referrer_id,
+                "code": confirm_code,
+                "expires": expires_at
+            }
+            
+            # Создаем клавиатуру с кнопкой подтверждения
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text=f"🔑 Подтвердить код: {confirm_code}", callback_data=f"confirm_{confirm_code}")]
+                ]
+            )
+            
+            await message.answer(
+                f"🔐 **Подтверждение приглашения**\n\n"
+                f"Вы перешли по приглашению друга!\n"
+                f"Чтобы приглашение засчиталось, нажмите кнопку ниже:\n\n"
+                f"Код: `{confirm_code}`\n\n"
+                f"⚠️ Код действителен 10 минут",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard
+            )
+            return  # Не даем доступ, пока не подтвердит
     
-    # Приветственное сообщение
+    # Если нет пригласившего ИЛИ пригласивший не существует
     welcome_text = (
         f"👋 Привет, {first_name}!\n\n"
         f"🎲 Каждую неделю мы разыгрываем призы!\n"
@@ -119,39 +149,145 @@ async def start_command(message: Message):
     
     await message.answer(welcome_text, reply_markup=get_main_keyboard())
 
+# Обработчик подтверждения по коду
+@dp.callback_query(lambda c: c.data and c.data.startswith('confirm_'))
+async def confirm_referral_callback(callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    received_code = callback_query.data.replace('confirm_', '')
+    
+    # Проверяем, есть ли ожидающее подтверждение
+    if user_id not in pending_confirmations:
+        await callback_query.answer(
+            "❌ Срок действия кода истек или он уже использован.",
+            show_alert=True
+        )
+        await callback_query.message.edit_text(
+            "❌ Код подтверждения недействителен. Попробуйте перейти по ссылке заново."
+        )
+        return
+    
+    confirm_data = pending_confirmations[user_id]
+    
+    # Проверяем срок действия
+    if datetime.now() > confirm_data["expires"]:
+        del pending_confirmations[user_id]
+        await callback_query.answer(
+            "❌ Время действия кода истекло (10 минут). Перейдите по ссылке заново.",
+            show_alert=True
+        )
+        await callback_query.message.edit_text(
+            "❌ Время действия кода истекло. Попробуйте перейти по ссылке заново."
+        )
+        return
+    
+    # Проверяем код
+    if received_code != confirm_data["code"]:
+        await callback_query.answer(
+            "❌ Неверный код подтверждения.",
+            show_alert=True
+        )
+        return
+    
+    # Всё хорошо - добавляем реферала
+    referrer_id = confirm_data["referrer_id"]
+    
+    # Проверяем, не был ли этот друг уже приглашен ранее
+    db.cursor.execute(
+        "SELECT id FROM referrals WHERE friend_id = ?",
+        (user_id,)
+    )
+    if db.cursor.fetchone():
+        await callback_query.answer(
+            "❌ Вы уже были приглашены ранее.",
+            show_alert=True
+        )
+        await callback_query.message.edit_text(
+            "❌ Вы уже зарегистрированы как чей-то друг ранее."
+        )
+        del pending_confirmations[user_id]
+        return
+    
+    # Добавляем реферала
+    success = db.add_referral(referrer_id, user_id)
+    
+    if success:
+        # Удаляем из временного хранилища
+        del pending_confirmations[user_id]
+        
+        # Уведомляем пригласившего
+        try:
+            friend_name = callback_query.from_user.first_name
+            await bot.send_message(
+                referrer_id,
+                f"🎉 По вашей ссылке зарегистрировался и подтвердил {friend_name}!\n"
+                f"Ваши билеты обновлены!"
+            )
+        except:
+            pass
+        
+        await callback_query.message.edit_text(
+            "✅ **Приглашение подтверждено!**\n\n"
+            "Теперь вам доступен розыгрыш бонусов!\n"
+            "Нажмите /start чтобы начать."
+        )
+        
+        # Отправляем приветствие с меню
+        user_info = db.get_user_stats(user_id)
+        await callback_query.message.answer(
+            f"Добро пожаловать!",
+            reply_markup=get_main_keyboard()
+        )
+    else:
+        await callback_query.answer(
+            "❌ Ошибка при добавлении приглашения. Возможно, вы уже были приглашены.",
+            show_alert=True
+        )
+
 # Обработчик кнопки "Я подписался"
 @dp.callback_query(lambda c: c.data == "check_sub")
-async def check_subscription_callback(callback_query: types.CallbackQuery):
+async def check_subscription_callback(callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     first_name = callback_query.from_user.first_name
     
     is_subscribed = await check_subscription(user_id)
     
     if is_subscribed:
-        # Если подписался - поздравляем и даем доступ
         await callback_query.message.edit_text(
             f"✅ Спасибо за подписку, {first_name}!\n\n"
             f"Теперь вам доступен розыгрыш бонусов!\n"
             f"Нажмите /start, чтобы начать."
         )
-        # Можно сразу отправить главное меню
         await callback_query.message.answer(
             f"Добро пожаловать!",
             reply_markup=get_main_keyboard()
         )
     else:
-        # Если всё еще не подписан
         await callback_query.answer(
             "❌ Вы ещё не подписались на канал. Пожалуйста, подпишитесь и нажмите кнопку снова.",
             show_alert=True
         )
 
-# Мои билеты
+# Функция очистки просроченных кодов (запускается периодически)
+async def clean_expired_codes():
+    while True:
+        await asyncio.sleep(60)  # Проверяем каждую минуту
+        now = datetime.now()
+        expired = [user_id for user_id, data in pending_confirmations.items() 
+                  if data["expires"] < now]
+        for user_id in expired:
+            del pending_confirmations[user_id]
+            print(f"Очищен просроченный код для user_id {user_id}")
+
+# --- ВСЕ ОСТАЛЬНЫЕ ОБРАБОТЧИКИ (my_tickets, top_week, invite_friend, copy_link, about_prize, draw_winner) ---
+# Они остаются ТОЧНО ТАКИМИ ЖЕ, как в предыдущей версии
+# Вставьте сюда код из предыдущего сообщения для функций:
+# my_tickets, top_week, invite_friend, copy_link_callback, about_prize, draw_winner
+
 @dp.message(lambda message: message.text == "🎫 Мои билеты")
 async def my_tickets(message: Message):
     user_id = message.from_user.id
     
-    # Дополнительная проверка подписки при каждом действии
+    # Проверка подписки
     if not await check_subscription(user_id):
         await message.answer(
             "❌ Вы отписались от канала. Подпишитесь снова для доступа к боту.",
@@ -161,7 +297,6 @@ async def my_tickets(message: Message):
     
     stats = db.get_user_stats(user_id)
     
-    # Получаем общее количество участников для расчета шанса
     week_start = db.get_week_start()
     db.cursor.execute(
         "SELECT SUM(tickets_count) FROM weekly_stats WHERE week_start = ?",
@@ -181,12 +316,10 @@ async def my_tickets(message: Message):
     
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
-# Топ недели
 @dp.message(lambda message: message.text == "📊 Топ недели")
 async def top_week(message: Message):
     user_id = message.from_user.id
     
-    # Проверка подписки
     if not await check_subscription(user_id):
         await message.answer(
             "❌ Вы отписались от канала. Подпишитесь снова для доступа к боту.",
@@ -219,12 +352,10 @@ async def top_week(message: Message):
     
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
-# Пригласить друга
 @dp.message(lambda message: message.text == "🔗 Пригласить друга")
 async def invite_friend(message: Message):
     user_id = message.from_user.id
     
-    # Проверка подписки
     if not await check_subscription(user_id):
         await message.answer(
             "❌ Вы отписались от канала. Подпишитесь снова для доступа к боту.",
@@ -240,7 +371,7 @@ async def invite_friend(message: Message):
         "🔗 **Твоя персональная ссылка для приглашения:**\n\n"
         f"`{ref_link}`\n\n"
         "📤 Отправь эту ссылку друзьям\n"
-        "👥 За каждого перешедшего получишь билет\n"
+        "👥 Друг должен подтвердить приглашение кнопкой\n"
         "🎁 Чем больше друзей, тем выше шанс!"
     )
     
@@ -250,20 +381,17 @@ async def invite_friend(message: Message):
     
     await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
-# Обработка кнопки "Копировать ссылку"
 @dp.callback_query(lambda c: c.data == "copy_link")
-async def copy_link_callback(callback_query: types.CallbackQuery):
+async def copy_link_callback(callback_query: CallbackQuery):
     await callback_query.answer(
         text="Ссылка скопирована! Просто выдели и скопируй сообщение выше 👆",
         show_alert=False
     )
 
-# О розыгрыше
 @dp.message(lambda message: message.text == "🏆 О розыгрыше")
 async def about_prize(message: Message):
     user_id = message.from_user.id
     
-    # Проверка подписки
     if not await check_subscription(user_id):
         await message.answer(
             "❌ Вы отписались от канала. Подпишитесь снова для доступа к боту.",
@@ -297,10 +425,8 @@ async def about_prize(message: Message):
     
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
-# Команда для розыгрыша (ТОЛЬКО ДЛЯ АДМИНА)
 @dp.message(Command("draw"))
 async def draw_winner(message: Message):
-    # Проверка на админа (замени ID на свой)
     if message.from_user.id != 1335144671:  # ВАШ TELEGRAM ID
         await message.answer("❌ Эта команда только для администратора")
         return
@@ -353,9 +479,8 @@ async def draw_winner(message: Message):
     except:
         pass
 
-# HTTP сервер для Render (чтобы убрать предупреждения о портах)
+# HTTP сервер для Render
 async def start_web_server():
-    """Запускает простой HTTP сервер для проверки Render"""
     app = web.Application()
     app.router.add_get('/', lambda request: web.Response(text="Bot is running"))
     runner = web.AppRunner(app)
@@ -366,6 +491,8 @@ async def start_web_server():
 
 # Запуск бота
 async def main():
+    # Запускаем фоновую очистку просроченных кодов
+    asyncio.create_task(clean_expired_codes())
     # Запускаем HTTP сервер для Render
     asyncio.create_task(start_web_server())
     # Запускаем бота
